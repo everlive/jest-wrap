@@ -1,24 +1,16 @@
 'use strict';
 
-/* globals WeakMap */
-
 var isCallable = require('is-callable');
 var isString = require('is-string');
-var has = require('has');
-var forEach = require('for-each');
 var isArray = require('isarray');
+var has = require('has');
 var functionName = require('function.prototype.name');
+var forEach = require('for-each');
 var inspect = require('object-inspect');
-
-var checkWithName = require('./helpers/checkWithName');
-
 var withOverrides = require('./withOverrides');
 var withOverride = require('./withOverride');
 var withGlobal = require('./withGlobal');
-
-var hasPrivacy = typeof WeakMap === 'function';
-var wrapperMap = hasPrivacy ? new WeakMap() : /* istanbul ignore next */ null;
-var modeMap = hasPrivacy ? new WeakMap() : /* istanbul ignore next */ null;
+var checkWithName = require('./helpers/checkWithName');
 
 var MODE_ALL = 'all';
 var MODE_SKIP = 'skip';
@@ -28,75 +20,38 @@ var beforeMethods = ['beforeAll', 'beforeEach'];
 var afterMethods = ['afterAll', 'afterEach'];
 var supportedMethods = [].concat(beforeMethods, afterMethods);
 
-var JestWrapper;
+var privateInstances = [];
+var getPrivateWrapper = function getPrivateWrapper(publicWrapper) {
+	return privateInstances.find(function (privateWrapper) {
+		return privateWrapper.getPublicWrapper() === publicWrapper;
+	});
+};
 
-var checkThis = function requireJestWrapper(instance) {
+var assertIsJestWrapper = function assertIsJestWrapper(instance) {
 	if (!instance || typeof instance !== 'object' || !(instance instanceof JestWrapper)) {
 		throw new TypeError(inspect(instance) + ' must be a JestWrapper');
 	}
 	return instance;
 };
 
-var setThisWrappers = function (instance, value) {
-	checkThis(instance);
-	/* istanbul ignore else */
-	if (hasPrivacy) {
-		wrapperMap.set(instance, value);
-	} else {
-		instance.wrappers = value;
-	}
-	return instance;
-};
-
-var getThisWrappers = function (instance) {
-	checkThis(instance);
-	return hasPrivacy ? wrapperMap.get(instance) : /* istanbul ignore next */ instance.wrappers;
-};
-
-var setThisMode = function (instance, mode) {
-	checkThis(instance);
-	/* istanbul ignore else */
-	if (hasPrivacy) {
-		modeMap.set(instance, mode);
-	} else {
-		instance.mode = mode;
-	}
-	return instance;
-};
-
-var getThisMode = function (instance) {
-	checkThis(instance);
-	return hasPrivacy ? modeMap.get(instance) : /* istanbul ignore next */ instance.mode;
-};
-
-JestWrapper = function JestWrapper() {
-	setThisWrappers(this, []);
-	setThisMode(this, MODE_ALL);
-};
-
-var createWithWrappers = function (wrappers) {
-	return setThisWrappers(new JestWrapper(), wrappers);
-};
-
-var concatThis = function (instance, toConcat) {
-	var thisWrappers = getThisWrappers(instance);
-	var thisMode = getThisMode(instance);
-	return setThisMode(createWithWrappers(thisWrappers.concat(toConcat || [])), thisMode);
-};
-
-var flattenToDescriptors = function flattenToDescriptors(wrappers) {
-	if (wrappers.length === 0) { return []; }
-
-	var descriptors = [];
-	forEach(wrappers, function (wrapper) {
-		var subWrappers = wrapper instanceof JestWrapper ? getThisWrappers(wrapper) : wrapper;
-		if (Array.isArray(subWrappers)) {
-			descriptors.push.apply(descriptors, flattenToDescriptors(subWrappers));
-		} else {
-			descriptors.push(subWrappers);
+/**
+ * Validate that a descriptor is the correct format for extending JestWrapper.
+ * Note: This converts hook values to arrays.
+ * eg { beforeEach: function () {} } becomes { beforeEach: [function () {}] }
+ */
+var validateDescriptor = function validateDescriptor(descriptor) {
+	forEach(supportedMethods, function (methodName) {
+		if (methodName in descriptor) {
+			if (!isArray(descriptor[methodName])) {
+				descriptor[methodName] = [descriptor[methodName]];
+			}
+			forEach(descriptor[methodName], function (method) {
+				if (!isCallable(method)) {
+					throw new TypeError('wrapper method "' + method + '" must be a function, or array of functions, if present');
+				}
+			});
 		}
 	});
-	return descriptors;
 };
 
 var applyMethods = function applyMethods(methodsToApply, descriptors) {
@@ -112,71 +67,160 @@ var applyMethods = function applyMethods(methodsToApply, descriptors) {
 	});
 };
 
-var createAssertion = function createAssertion(type, message, wrappers, block, mode) {
-	var descriptors = flattenToDescriptors(wrappers);
-	if (descriptors.length === 0) {
-		throw new RangeError(inspect(type) + ' called with no wrappers defined');
-	}
+/**
+ * This is a convenience class created for easier jest-wrap development, it is
+ * private to prevent expanding the public api.
+ */
+var PrivateWrapper = function PrivateWrapper(publicWrapper) {
+	this.publicWrapper = publicWrapper;
+	this.descriptors = [];
+	this.mode = MODE_ALL;
+};
 
-	var describeMsgs = [];
-	forEach(descriptors, function (descriptor) {
-		if (descriptor.description) {
-			describeMsgs.push(descriptor.description);
+/**
+ * This is the public version of the wrapper.
+ * It's what gets returned from wrap() + all the public apis.
+ */
+var JestWrapper = function JestWrapper() {
+	privateInstances.push(new PrivateWrapper(this));
+};
+
+Object.assign(PrivateWrapper.prototype, {
+	describe: function describe(message, callback) {
+		this.createAssertion('describe', message, this.wrappers, callback, this.mode);
+	},
+
+	it: function it(message, callback) {
+		this.createAssertion('it', message, this.wrappers, callback, this.mode);
+	},
+
+	test: function test(message, callback) {
+		this.createAssertion('test', message, this.wrappers, callback, this.mode);
+	},
+
+	extend: function extend(description, descriptor) {
+		if (!isString(description) || description.length === 0) {
+			throw new TypeError('a non-empty description string is required');
 		}
-	});
+		if (descriptor) {
+			validateDescriptor(descriptor);
+			descriptor.description = description;
+			this.descriptors = this.descriptors.concat(descriptor);
+		}
 
-	var describeMsg = 'wrapped: ' + describeMsgs.join('; ') + ':';
-	var describeMethod = global.describe;
-	if (mode === MODE_SKIP) {
-		describeMethod = global.describe.skip;
-	} else if (mode === MODE_ONLY) {
-		describeMethod = global.describe.only;
+		return this;
+	},
+
+	use: function use(plugin) {
+		if (!isCallable(plugin)) {
+			throw new TypeError('plugin must be a function');
+		}
+		var withName = functionName(plugin);
+		checkWithName(withName);
+
+		var extraArguments = Array.prototype.slice.call(arguments, 1);
+		var descriptorOrInstance = plugin.apply(this.getPublicWrapper(), extraArguments) || {};
+
+		if (!(descriptorOrInstance instanceof JestWrapper)) {
+			return this.extend(descriptorOrInstance.description, descriptorOrInstance);
+		}
+
+		return this;
+	},
+
+	createAssertion: function createAssertion(type, message, wrappers, block, mode) {
+		var descriptors = this.descriptors;
+		if (descriptors.length === 0) {
+			throw new RangeError(inspect(type) + ' called with no wrappers defined');
+		}
+		var describeMsgs = descriptors.reduce(function descriptorReducer(descriptions, descriptor) {
+			if (descriptor.description) {
+				descriptions.push(descriptor.description);
+			}
+			return descriptions;
+		}, []);
+
+		var describeMsg = 'wrapped: ' + describeMsgs.join('; ') + ':';
+		var describeMethod = global.describe;
+		if (mode === MODE_SKIP) {
+			describeMethod = global.describe.skip;
+		} else if (mode === MODE_ONLY) {
+			describeMethod = global.describe.only;
+		}
+
+		describeMethod(describeMsg, function () {
+			applyMethods(beforeMethods, descriptors);
+			global[type](message, block);
+			applyMethods(['afterEach'], descriptors);
+			applyMethods(['afterAll'], descriptors.reverse());
+		});
+	},
+
+	only: function only() {
+		this.mode = MODE_ONLY;
+		return this;
+	},
+
+	skip: function only() {
+		this.mode = MODE_SKIP;
+		return this;
+	},
+
+	getPublicWrapper: function getPublicWrapper() {
+		return this.publicWrapper;
 	}
-	describeMethod(describeMsg, function () {
-		applyMethods(beforeMethods, descriptors);
-		global[type](message, block);
-		applyMethods(['afterEach'], descriptors);
-		applyMethods(['afterAll'], descriptors.reverse());
-	});
-};
+});
 
-JestWrapper.prototype.skip = function skip() {
-	return setThisMode(concatThis(this), MODE_SKIP);
-};
+Object.assign(JestWrapper.prototype, {
+	describe: function describe(message, callback) {
+		assertIsJestWrapper(this);
+		getPrivateWrapper(this).describe(message, callback);
+	},
+	it: function it(message, callback) {
+		assertIsJestWrapper(this);
+		getPrivateWrapper(this).it(message, callback);
+	},
+	test: function test(message, callback) {
+		assertIsJestWrapper(this);
+		getPrivateWrapper(this).test(message, callback);
+	},
+	extend: function extend(message, descriptors) {
+		assertIsJestWrapper(this);
+		return getPrivateWrapper(this).extend(message, descriptors).getPublicWrapper();
+	},
+	use: function use() {
+		assertIsJestWrapper(this);
+		var privateWrapper = getPrivateWrapper(this);
+		return privateWrapper.use.apply(privateWrapper, arguments).getPublicWrapper();
+	},
+	only: function only() {
+		return getPrivateWrapper(this).only().getPublicWrapper();
+	},
+	skip: function skip() {
+		return getPrivateWrapper(this).skip().getPublicWrapper();
+	}
+});
 
-JestWrapper.prototype.only = function only() {
-	return setThisMode(concatThis(this), MODE_ONLY);
-};
-
-JestWrapper.prototype.it = function it(msg, fn) {
-	var wrappers = getThisWrappers(checkThis(this));
-	var mode = getThisMode(this);
-	createAssertion('it', msg, wrappers, fn, mode);
-};
+/**
+ * TODO - Comment and explain this... why is this the case? Also, these can
+ * probably be programatically generated.
+ */
 JestWrapper.prototype.it.skip = function skip() {
 	throw new SyntaxError('jest-wrap requires `.skip().it` rather than `it.skip`');
 };
+
 JestWrapper.prototype.it.only = function only() {
 	throw new SyntaxError('jest-wrap requires `.only().it` rather than `it.only`');
 };
 
-JestWrapper.prototype.test = function test(msg, fn) {
-	var wrappers = getThisWrappers(checkThis(this));
-	var mode = getThisMode(this);
-	createAssertion('test', msg, wrappers, fn, mode);
-};
 JestWrapper.prototype.test.skip = function skip() {
 	throw new SyntaxError('jest-wrap requires `.skip().test` rather than `test.skip`');
 };
+
 JestWrapper.prototype.test.only = function only() {
 	throw new SyntaxError('jest-wrap requires `.only().test` rather than `test.only`');
 };
 
-JestWrapper.prototype.describe = function describe(msg, fn) {
-	var wrappers = getThisWrappers(checkThis(this));
-	var mode = getThisMode(this);
-	createAssertion('describe', msg, wrappers, fn, mode);
-};
 JestWrapper.prototype.describe.skip = function skip() {
 	throw new SyntaxError('jest-wrap requires `.skip().describe` rather than `describe.skip`');
 };
@@ -184,76 +228,48 @@ JestWrapper.prototype.describe.only = function only() {
 	throw new SyntaxError('jest-wrap requires `.only().describe` rather than `describe.only`');
 };
 
-var wrap = function wrap() { return new JestWrapper(); };
-
-var isWithNameAvailable = function (name) {
-	checkWithName(name);
-	return !has(JestWrapper.prototype, name) || !isCallable(JestWrapper.prototype[name]);
+var wrap = function wrap() {
+	return new JestWrapper();
 };
 
+/**
+ * Expose the list of supportedMethods [beforeAll, beforeEach, etc.], freeze
+ * them to prevent mutation if possible.
+ */
 wrap.supportedMethods = isCallable(Object.freeze)
 	? Object.freeze(supportedMethods)
 	: /* istanbul ignore next */ supportedMethods.slice();
 
-JestWrapper.prototype.extend = function extend(description, descriptor) {
-	checkThis(this);
-	if (!isString(description) || description.length === 0) {
-		throw new TypeError('a non-empty description string is required');
-	}
-	var newWrappers = [];
-	if (descriptor) {
-		forEach(supportedMethods, function (methodName) {
-			if (methodName in descriptor) {
-				if (!isArray(descriptor[methodName])) {
-					descriptor[methodName] = [descriptor[methodName]];
-				}
-				forEach(descriptor[methodName], function (method) {
-					if (!isCallable(method)) {
-						throw new TypeError('wrapper method "' + method + '" must be a function, or array of functions, if present');
-					}
-				});
-			}
-		});
-		descriptor.description = description;
-		newWrappers = [createWithWrappers([descriptor])];
-	}
-	return concatThis(this, newWrappers);
+/**
+ * Checks if a given withHelper function name is available.
+ */
+var isWithNameAvailable = function (name) {
+	checkWithName(name); // This will throw if the supplied name is invalid.
+	return !has(JestWrapper.prototype, name) || !isCallable(JestWrapper.prototype[name]);
 };
 
-JestWrapper.prototype.use = function use(plugin) {
-	checkThis(this);
-	if (!isCallable(plugin)) {
-		throw new TypeError('plugin must be a function');
-	}
-	var withName = functionName(plugin);
-	checkWithName(withName);
-
-	var extraArguments = Array.prototype.slice.call(arguments, 1);
-	var descriptorOrInstance = plugin.apply(this, extraArguments) || {};
-
-	var instance = descriptorOrInstance;
-	if (!(descriptorOrInstance instanceof JestWrapper)) {
-		instance = wrap().extend(descriptorOrInstance.description, descriptorOrInstance);
-	}
-
-	return setThisWrappers(new JestWrapper(), [instance]);
-};
-
+/**
+ * Register a new withHelper function for all JestWrappers.
+ * Developers must pass a named function (function withName() {}), that follows
+ * the with<Name> convention.
+ */
 wrap.register = function register(plugin) {
-	var withName = functionName(plugin);
-	checkWithName(withName);
+	var withName = functionName(plugin); // get the name of the passed function.
 	if (!isWithNameAvailable(withName)) {
 		// already registered
 		return;
 	}
+
 	JestWrapper.prototype[withName] = function wrapper() {
 		return this.use.apply(this, [plugin].concat(Array.prototype.slice.call(arguments)));
 	};
 };
 
+/**
+ * Removes a previously registered withHelper.
+ */
 wrap.unregister = function unregister(pluginOrWithName) {
 	var withName = isCallable(pluginOrWithName) ? functionName(pluginOrWithName) : pluginOrWithName;
-	checkWithName(withName);
 	if (isWithNameAvailable(withName)) {
 		throw new RangeError('error: plugin "' + withName + '" is not registered.');
 	}
